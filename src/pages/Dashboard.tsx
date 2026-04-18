@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import Sidebar from '../components/Sidebar';
 import PasswordRow from '../components/PasswordRow';
-import { Search, Plus, X } from 'lucide-react';
+import { Search, Plus, X, LogOut, UserCircle, Upload } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { supabase } from '../lib/supabase';
+import Papa from 'papaparse';
 
 interface PasswordData {
     id: number;
@@ -12,12 +14,15 @@ interface PasswordData {
     password_decrypted: string;
 }
 
-export default function Dashboard() {
+// 1. NUESTRA NUEVA REGLA: El Dashboard no entra a menos que le paguen con la "masterKey"
+interface DashboardProps {
+    masterKey: string;
+    userEmail: string; // Recibimos tu identidad de la Nube
+}
+
+export default function Dashboard({ masterKey, userEmail }: DashboardProps) {
     const [passwords, setPasswords] = useState<PasswordData[]>([]);
-
     const [isModalOpen, setIsModalOpen] = useState(false);
-
-    // NUESTRA MENTE: Para saber si estamos Creando o Editando (Si es null, es nueva)
     const [editId, setEditId] = useState<number | null>(null);
 
     const [newSite, setNewSite] = useState('');
@@ -25,25 +30,74 @@ export default function Dashboard() {
     const [newUser, setNewUser] = useState('');
     const [newPass, setNewPass] = useState('');
 
+    // La Referencia para el Input Fantasma (Para importar el CSV)
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    // 2. Modificamos la carga de inicio para inyectarle la masterKey
     async function fetchPasswords() {
         try {
-            const data: PasswordData[] = await invoke('get_all_passwords');
+            const data: PasswordData[] = await invoke('get_all_passwords', { masterPass: masterKey });
             setPasswords(data);
         } catch (error) {
             console.error("Error al traer contraseñas:", error);
+            // 🚨 SISTEMA DE DEFENSA: Si Rust rechaza la llave, botamos al usuario a patadas
+            if (error === "Clave Maestra Incorrecta") {
+                alert("🚨 ALARMA DE INTRUSO: La Clave Maestra es Incorrecta. Bloqueando Sistema...");
+                window.location.reload(); // Recarga la app regresándote al candado negro
+            }
         }
     }
 
     useEffect(() => { fetchPasswords(); }, []);
 
-    // NUEVA FUNCION: Abrir modal totalmente en blanco (Para Crear una nueva)
+    // 4. Mecanismo de Abandono de Búnker
+    async function handleLogout() {
+        await supabase.auth.signOut();
+        window.location.reload(); // Recarga y nos expulsa hacia el inicio
+    }
+
+    // 5. Succión Masiva de Archivo CSV (Soporta Google Chrome, Edge o Bitwarden export)
+    function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        Papa.parse(file, {
+            header: true,
+            skipEmptyLines: true,
+            complete: async function(results) {
+                // Iteramos a toda velocidad sobre el arreglo de contraseñas de CSV
+                for (const row of results.data as any[]) {
+                    // Los navegadores por defecto exponen 4 columnas principales
+                    if (row.name && row.password) {
+                        try {
+                            await invoke('encrypt_and_save', {
+                                site: row.name,
+                                url: row.url || 'http://',
+                                user: row.username || 'Sin Usuario',
+                                rawPass: row.password,
+                                masterPass: masterKey // <--- Le inyectamos tu llave Gema
+                            });
+                        } catch (err) {
+                            console.error("Fallo insertando fila", err);
+                        }
+                    }
+                }
+                
+                alert(`¡Bóveda Reforzada! Se migraron ${results.data.length} contraseñas exitosamente al núcleo encriptado de Rust.`);
+                fetchPasswords(); // Recarga y dibuja todo de golpe en la pantalla
+            }
+        });
+
+        // Limpia la memoria del botón Fantasma
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+
     function openNewModal() {
         setEditId(null);
         setNewSite(''); setNewUrl(''); setNewUser(''); setNewPass('');
         setIsModalOpen(true);
     }
 
-    // NUEVA FUNCION: Atrapa la fila que pinchas con el lápiz y la pone en las cajas de texto
     function handleEditRequest(pass: any) {
         setEditId(pass.id);
         setNewSite(pass.site);
@@ -53,7 +107,7 @@ export default function Dashboard() {
         setIsModalOpen(true);
     }
 
-    // NUESTRA SUPER FUNCIÓN CEREBRO (Sabe si guardar nueva o si actualizar la vieja)
+    // 3. Modificamos el guardado para inyectarle la masterKey 
     async function handleSave() {
         if (!newSite || !newUrl || !newUser || !newPass) {
             alert("Por favor llena todos los recuadritos primero");
@@ -62,25 +116,24 @@ export default function Dashboard() {
 
         try {
             if (editId !== null) {
-                // MODIFICAR: Viaja por el comando update_password usando su ID escondido
                 await invoke('update_password', {
                     id: editId,
                     site: newSite,
                     url: newUrl,
                     user: newUser,
-                    rawPass: newPass
+                    rawPass: newPass,
+                    masterPass: masterKey // <-- El Pasaporte Criptográfico Privado
                 });
             } else {
-                // CREAR: Viaja por la ruta tradicional
                 await invoke('encrypt_and_save', {
                     site: newSite,
                     url: newUrl,
                     user: newUser,
-                    rawPass: newPass
+                    rawPass: newPass,
+                    masterPass: masterKey // <-- El Pasaporte Criptográfico Privado
                 });
             }
 
-            // Si ambos triunfan, cerramos todo en blanco
             setEditId(null);
             setNewSite(''); setNewUrl(''); setNewUser(''); setNewPass('');
             setIsModalOpen(false);
@@ -92,7 +145,7 @@ export default function Dashboard() {
 
     return (
         <div className="flex h-screen bg-gray-50 w-full overflow-hidden font-sans relative">
-            <Sidebar />
+            <Sidebar userEmail={userEmail} onLogout={handleLogout} />
 
             <main className="flex-1 p-10 overflow-y-auto">
                 <header className="flex justify-between items-center mb-10">
@@ -105,12 +158,31 @@ export default function Dashboard() {
                         <Search className="absolute left-3 top-3.5 text-gray-400" size={20} />
                     </div>
 
-                    <button
-                        onClick={openNewModal}
-                        className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-blue-200 flex items-center gap-2 transition hover:-translate-y-1">
-                        <Plus size={20} />
-                        Nueva Contraseña
-                    </button>
+                    <div className="flex gap-4">
+                        {/* El Input Fantasma */}
+                        <input
+                            type="file"
+                            accept=".csv"
+                            ref={fileInputRef}
+                            onChange={handleFileUpload}
+                            className="hidden"
+                        />
+
+                        {/* El Gatillo que tú ves en la pantalla */}
+                        <button
+                            onClick={() => fileInputRef.current?.click()}
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-emerald-200 flex items-center gap-2 transition hover:-translate-y-1">
+                            <Upload size={20} />
+                            Subir CSV
+                        </button>
+
+                        <button
+                            onClick={openNewModal}
+                            className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-xl font-bold shadow-lg shadow-blue-200 flex items-center gap-2 transition hover:-translate-y-1">
+                            <Plus size={20} />
+                            Nueva Contraseña
+                        </button>
+                    </div>
                 </header>
 
                 <section className="bg-white rounded-2xl p-8 shadow-sm border border-gray-100 min-h-[60vh]">
@@ -126,7 +198,7 @@ export default function Dashboard() {
                                 username={pass.username}
                                 password_decrypted={pass.password_decrypted}
                                 onRefresh={fetchPasswords}
-                                onEdit={handleEditRequest} // <-- INYECTAMOS EL CONECTOR DEL LÁPIZ
+                                onEdit={handleEditRequest}
                             />
                         ))}
                     </div>
@@ -141,7 +213,6 @@ export default function Dashboard() {
                             <X size={24} />
                         </button>
 
-                        {/* El Título cambia mágicamente si estás editando */}
                         <h2 className="text-2xl font-bold mb-6 text-gray-800">
                             {editId !== null ? '📝 Editar Contraseña' : 'Caja Fuerte 🔐'}
                         </h2>
@@ -169,5 +240,3 @@ export default function Dashboard() {
         </div>
     );
 }
-
-
